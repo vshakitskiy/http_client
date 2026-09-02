@@ -69,7 +69,10 @@ pub opaque type Builder {
     redirects: Redirects,
     default_headers: List(#(String, String)),
     max_response_body: Int,
+    tls_versions: List(TlsVersion),
+    server_name: Option(String),
     timeouts: Timeouts,
+    deadline: Deadline,
     pool: PoolOptions,
     http1: Http1Options,
     http2: Http2Options,
@@ -104,7 +107,10 @@ pub fn new() -> Builder {
     redirects: Never,
     default_headers: [],
     max_response_body: 8_388_608,
+    tls_versions: [Tls13, Tls12],
+    server_name: None,
     timeouts: default_timeouts(),
+    deadline: NoDeadline,
     pool: default_pool_options(),
     http1: default_http1_options(),
     http2: default_http2_options(),
@@ -199,6 +205,34 @@ pub fn with_client_certificate(
   Builder(..builder, client_certificate: Some(certificate))
 }
 
+/// Set which versions of TLS the client offers. Defaults to `[Tls13, Tls12]`.
+///
+/// An empty list leaves the versions to OTP.
+///
+/// # Examples
+///
+/// ```gleam
+/// client.new() |> client.with_tls_versions([client.Tls12])
+/// ```
+pub fn with_tls_versions(
+  builder: Builder,
+  versions: List(TlsVersion),
+) -> Builder {
+  Builder(..builder, tls_versions: versions)
+}
+
+/// Set the name sent in SNI and checked against the server's certificate. The
+/// request's host is used by default.
+///
+/// # Examples
+///
+/// ```gleam
+/// client.new() |> client.with_server_name("api.internal")
+/// ```
+pub fn with_server_name(builder: Builder, name: String) -> Builder {
+  Builder(..builder, server_name: Some(name))
+}
+
 /// Set whether redirect responses are followed. Defaults to `Never`.
 ///
 /// # Examples
@@ -255,6 +289,17 @@ pub fn with_timeouts(builder: Builder, timeouts: Timeouts) -> Builder {
   Builder(..builder, timeouts:)
 }
 
+/// Set a ceiling over the whole request. Defaults to `NoDeadline`.
+///
+/// # Examples
+///
+/// ```gleam
+/// client.new() |> client.with_deadline(client.After(milliseconds: 30_000))
+/// ```
+pub fn with_deadline(builder: Builder, deadline: Deadline) -> Builder {
+  Builder(..builder, deadline:)
+}
+
 /// Set how many connections the pool holds and how long it holds them for. Does
 /// nothing to a request made with `dispatch` or `dispatch_stream`.
 ///
@@ -274,7 +319,7 @@ pub fn with_pool(builder: Builder, options: PoolOptions) -> Builder {
 ///
 /// ```gleam
 /// client.new()
-/// |> client.with_http1(Http1Options(..client.default_http1_options(), max_headers: 50))
+/// |> client.with_http1(Http1Options(..client.default_http1_options(), max_header_section: 32_768))
 /// ```
 pub fn with_http1(builder: Builder, options: Http1Options) -> Builder {
   Builder(..builder, http1: options)
@@ -326,7 +371,8 @@ pub fn supervised(
   |> supervision.supervisor
 }
 
-/// A version of HTTP as reported by `protocol`.
+/// A version of HTTP carried by the `UnexpectedProtocol` variant of
+/// `SendError`.
 pub type Protocol {
   Http1
   Http2
@@ -413,11 +459,27 @@ pub type Redirects {
   Follow(limit: Int)
 }
 
+/// Which versions of TLS the client offers given to `with_tls_versions`.
+pub type TlsVersion {
+  Tls12
+  Tls13
+}
+
+/// A ceiling over a whole request given to `with_deadline`.
+pub type Deadline {
+  /// Leave each stage to its own timeout.
+  NoDeadline
+  /// Fail with `TotalTimedOut` after `milliseconds` however far the request
+  /// has got. Covers every redirect hop.
+  After(milliseconds: Int)
+}
+
 /// How long each stage of a request may take in milliseconds.
 ///
 /// Build one by updating `default_timeouts` so you only update the ones you
 /// care about. A value outside the range a field accepts is replaced with the
-/// default and logged as a warning when the client starts.
+/// default and logged as a warning when the client starts. Use `with_deadline`
+/// for a ceiling over every stage at once.
 ///
 /// # Examples
 ///
@@ -428,7 +490,7 @@ pub type Timeouts {
   Timeouts(
     /// How long the pool waits for a free connection.
     checkout: Int,
-    /// How long a single connection attempt waits. Each address a host resolves 
+    /// How long a single connection attempt waits. Each address a host resolves
     /// to gets this long.
     connect: Int,
     /// How long the TLS handshake and the HTTP/2 settings exchange after it
@@ -440,10 +502,6 @@ pub type Timeouts {
     response_headers: Int,
     /// How long a single read of a response body waits.
     body_read: Int,
-    // TODO: move it as a separate value.
-    /// A ceiling over every stage above. `None` leaves each stage to its own
-    /// timeout.
-    total: Option(Int),
   )
 }
 
@@ -477,8 +535,6 @@ pub type PoolOptions {
     /// connection per origin, capped by `max_concurrent_streams` of
     /// `Http2Options`.
     max_connections: Int,
-    /// The most connections to one origin kept open with nothing to do.
-    max_idle_connections: Int,
     /// How long a connection may sit doing nothing before it is closed.
     idle_timeout: Int,
     /// How long a connection may be used for before it is retired. `None`
@@ -487,8 +543,6 @@ pub type PoolOptions {
     /// How much of an unread body `discard_body` will drain. A larger body
     /// closes the connection instead.
     auto_drain_limit: Int,
-    /// How much of that drain is read at a time.
-    auto_drain_chunk_bytes: Int,
   )
 }
 
@@ -515,22 +569,13 @@ pub fn default_pool_options() -> PoolOptions {
 /// # Examples
 ///
 /// ```gleam
-/// Http1Options(..client.default_http1_options(), max_headers: 50)
+/// Http1Options(..client.default_http1_options(), max_header_section: 32_768)
 /// ```
 pub type Http1Options {
   Http1Options(
-    /// The longest status line accepted.
-    max_status_line: Int,
-    /// The longest single header line accepted.
-    max_header_line: Int,
-    /// The most header fields a response may carry.
-    max_headers: Int,
-    /// The longest chunk size line accepted in a chunked body.
-    max_chunk_size_line: Int,
-    /// The most 1xx responses, such as `103 Early Hints`, read and passed over
-    /// before the real response.
-    max_interim_responses: Int,
-    // TODO: ???
+    /// The most bytes the status line and the header fields of a response may
+    /// total.
+    max_header_section: Int,
     /// How long a request carrying `expect: 100-continue` waits for the
     /// server's go-ahead before sending its body anyway.
     expect_continue_timeout: Int,
@@ -542,8 +587,8 @@ pub type Http1Options {
 /// # Examples
 ///
 /// ```gleam
-/// client.default_http1_options().max_headers
-/// // -> 100
+/// client.default_http1_options().max_header_section
+/// // -> 262_144
 /// ```
 pub fn default_http1_options() -> Http1Options {
   todo
@@ -567,9 +612,14 @@ pub type Http2Options {
     /// the server allows. The server's `SETTINGS_MAX_CONCURRENT_STREAMS` is a
     /// ceiling over this.
     max_concurrent_streams: Option(Int),
-    /// How much response body a stream may have in flight before the client
-    /// allows more. Must be within 0 and 2147483647.
+    /// How much response body may be in flight across the whole connection.
+    /// Must be within 0 and 2147483647.
+    connection_window_size: Int,
+    /// How much response body may be in flight on one stream. Must be within 0
+    /// and 2147483647.
     initial_window_size: Int,
+    /// How far a receive window may fall before the client tops it back up.
+    window_update_threshold: Int,
     /// The largest frame the client accepts. Must be within 16384 and
     /// 16777215.
     max_frame_size: Int,
@@ -577,15 +627,6 @@ pub type Http2Options {
     max_header_list_size: Option(Int),
     /// How much HPACK dynamic table the client keeps for decoding.
     header_table_size: Int,
-    /// The most CONTINUATION frames one header sequence may span.
-    max_continuation_frames: Int,
-    /// The most bytes of HEADERS and CONTINUATION one header block may total,
-    /// counted before it is decoded.
-    max_header_block_bytes: Int,
-    /// The level a receive window is topped up at.
-    receive_window_low_water_mark: Int,
-    /// The level a receive window is topped up to.
-    receive_window_high_water_mark: Int,
     /// How often an idle pooled connection is sent a PING. `None` sends none.
     ping_interval: Option(Int),
     /// How long a ping waits for its answer before the connection is closed.
@@ -607,10 +648,6 @@ pub type Http2Options {
 pub fn default_http2_options() -> Http2Options {
   todo
 }
-
-// ---------------------------------------------------------------------------
-// Request bodies
-// ---------------------------------------------------------------------------
 
 /// The body of a request.
 pub type Body {
@@ -853,18 +890,6 @@ pub fn dispatch_stream(
   todo
 }
 
-/// The version of HTTP that carried a response.
-///
-/// # Examples
-///
-/// ```gleam
-/// client.protocol(response)
-/// // -> client.Http2
-/// ```
-pub fn protocol(response: Response(Connection)) -> Protocol {
-  todo
-}
-
 /// The reason a response body could not be read.
 pub type BodyError {
   /// The body is larger than the limit that was given.
@@ -1033,19 +1058,13 @@ pub type ProtocolError {
   /// HTTP/1: a header line has no colon, or a name or value holding bytes a
   /// header may not.
   InvalidHeaderLine
-  /// HTTP/1: the status line is longer than `max_status_line` allows.
-  StatusLineTooLong
-  /// HTTP/1: a header line is longer than `max_header_line` allows.
-  HeaderLineTooLong
-  /// HTTP/1: the response carries more headers than `max_headers` allows.
-  TooManyHeaders
-  /// HTTP/1: a chunk size line is longer than `max_chunk_size_line` allows.
-  ChunkSizeLineTooLong
+  /// HTTP/1: the status line and the header fields together are longer than
+  /// `max_header_section` of `Http1Options` allows.
+  HeaderSectionTooLarge
   /// HTTP/1: a chunked body has a malformed size line or is missing its
   /// terminator.
   InvalidChunkedBody
-  /// HTTP/1: more 1xx responses arrived in a row than `max_interim_responses`
-  /// allows.
+  /// HTTP/1: more 1xx responses arrived in a row than the client will read.
   TooManyInterimResponses
   /// HTTP/1: the framing headers contradict each other such as a
   /// `content-length` alongside a `transfer-encoding: chunked`.
@@ -1057,8 +1076,9 @@ pub type ProtocolError {
   /// HTTP/2: the response has no `:status`, carries a pseudo-header a response
   /// may not, or carries one after an ordinary header.
   InvalidPseudoHeaders
-  /// HTTP/2: a header block is longer than `max_header_block_bytes` or spans
-  /// more CONTINUATION frames than `max_continuation_frames` allows.
+  /// HTTP/2: a header block is longer than `max_header_list_size` of
+  /// `Http2Options` allows, or spans more CONTINUATION frames than the client
+  /// will read.
   HeaderBlockTooLarge
   /// HTTP/2: a header block could not be decoded.
   HeaderDecodingFailed
@@ -1120,50 +1140,61 @@ pub type SocketReason {
   UnknownReason
 }
 
-/// Describe a `SendError` in a form that reads inside a log line.
+/// Whether the request behind a `SendError` provably never reached the server.
+///
+/// True only where the request can be sent again with no risk of it being
+/// carried out twice. A `ConnectionClosed` after any part of the response has 
+/// arrived is false.
+///
+/// # Examples
+///
+/// ```gleam
+/// client.is_retryable(client.StreamReset(client.RefusedStream))
+/// // -> True
+///
+/// client.is_retryable(client.MalformedResponse(client.InvalidChunkedBody))
+/// // -> False
+/// ```
+pub fn is_retryable(error: SendError) -> Bool {
+  todo
+}
+
+/// Describe a `SendError` in a form that reads inside a log line. Nested
+/// errors are described within it.
 ///
 /// # Examples
 ///
 /// ```gleam
 /// client.send_error_to_string(client.PoolTimedOut)
 /// // -> "no connection came free in time"
+///
+/// client.send_error_to_string(client.TlsFailed(client.HostnameMismatch))
+/// // -> "the TLS handshake failed: the certificate was issued for another host"
 /// ```
 pub fn send_error_to_string(error: SendError) -> String {
   todo
 }
 
-/// Describe a `TlsError` in a form that reads inside a log line.
+/// Describe a `BodyError` in a form that reads inside a log line.
 ///
 /// # Examples
 ///
 /// ```gleam
-/// client.tls_error_to_string(client.HostnameMismatch)
-/// // -> "the certificate was issued for another host"
+/// client.body_error_to_string(client.BodyTooLarge)
+/// // -> "the body is larger than the limit that was given"
 /// ```
-pub fn tls_error_to_string(error: TlsError) -> String {
+pub fn body_error_to_string(error: BodyError) -> String {
   todo
 }
 
-/// Describe a `ProtocolError` in a form that reads inside a log line.
+/// Describe a `FileError` in a form that reads inside a log line.
 ///
 /// # Examples
 ///
 /// ```gleam
-/// client.protocol_error_to_string(client.ServerPushed)
-/// // -> "the server pushed a stream that was not asked for"
+/// client.file_error_to_string(client.IsDirectory)
+/// // -> "the path is a directory"
 /// ```
-pub fn protocol_error_to_string(error: ProtocolError) -> String {
-  todo
-}
-
-/// Describe a `SocketReason` in a form that reads inside a log line.
-///
-/// # Examples
-///
-/// ```gleam
-/// client.socket_reason_to_string(client.NetworkDown)
-/// // -> "the network is down"
-/// ```
-pub fn socket_reason_to_string(reason: SocketReason) -> String {
+pub fn file_error_to_string(error: FileError) -> String {
   todo
 }
