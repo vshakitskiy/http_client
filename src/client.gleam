@@ -7,26 +7,26 @@
 //// pub fn main() {
 ////   let pool_name = process.new_name("http_client")
 ////   let assert Ok(started) = client.new() |> client.start(name: pool_name)
-////
+////   let pool = started.data
+//// 
 ////   let assert Ok(request) = request.to("https://gleam.run")
 ////
 ////   let assert Ok(response) =
 ////     request.set_body(request, client.Empty)
-////     |> client.send(using: started.data)
+////     |> client.send(using: pool)
 ////
-////   let assert Ok(response) = client.read_body(response, limit: 1_048_576)
 ////   response.status
 ////   // -> 200
 //// }
 //// ```
 ////
-//// `send` returns once the response head has arrived. The body is left on the
-//// connection for `read_body` or `read_body_chunk` and the connection is
-//// released once the body has been read to the end. `discard_body` and
-//// `cancel_body` release it without reading the rest.
+//// `send` reads the whole body into memory and releases the connection. 
+//// `stream` returns once the response head has arrived and leaves the body on 
+//// the connection for `read_body` or `read_body_chunk`. `discard_body` and
+//// `cancel_body` release the connection without reading the rest.
 ////
-//// `send_once` takes a `Builder` in place of a running pool and gives the
-//// request a connection of its own. Responses are read back the same way.
+//// `dispatch` and `dispatch_stream` take a `Builder` in place of a running pool
+//// and give the request a connection of its own.
 
 import client/internal/connection
 import client/internal/pool
@@ -58,26 +58,22 @@ pub fn from_name(pool_name: Name(pool.Message)) -> Client {
 /// The configuration of a client.
 ///
 /// Create one with `new`, adjust it with the builder functions, then give it
-/// to `start`, `supervised` or `send_once`.
+/// to `start`, `supervised`, `dispatch` or `dispatch_stream`.
 pub opaque type Builder {
   Builder(
-    transport: Transport,
+    address_family: AddressFamily,
+    proxy: Option(Proxy),
     protocols: Protocols,
     verification: Verification,
     client_certificate: Option(ClientCertificate),
     redirects: Redirects,
     default_headers: List(#(String, String)),
+    max_response_body: Int,
     timeouts: Timeouts,
     pool: PoolOptions,
     http1: Http1Options,
     http2: Http2Options,
   )
-}
-
-type Transport {
-  Tcp(address_family: AddressFamily)
-  Unix(path: String)
-  Proxied(proxy: Proxy)
 }
 
 type AddressFamily {
@@ -88,9 +84,9 @@ type AddressFamily {
 
 /// Create a new client configuration.
 ///
-/// By default the connections are made over TCP to whichever IP family answers 
-/// first, HTTP/2 and HTTP/1 are offered over ALPN, certificates are checked 
-/// against the operating system's trust store and redirects are not followed.
+/// By default the connections are made to whichever IP family answers first,
+/// HTTP/2 and HTTP/1 are offered over ALPN, certificates are checked against
+/// the operating system's trust store and redirects are not followed.
 ///
 /// # Examples
 ///
@@ -100,12 +96,14 @@ type AddressFamily {
 /// ```
 pub fn new() -> Builder {
   Builder(
-    transport: Tcp(AnyAddressFamily),
+    address_family: AnyAddressFamily,
+    proxy: None,
     protocols: Http2ThenHttp1,
     verification: SystemCertificates,
     client_certificate: None,
     redirects: Never,
     default_headers: [],
+    max_response_body: 8_388_608,
     timeouts: default_timeouts(),
     pool: default_pool_options(),
     http1: default_http1_options(),
@@ -113,24 +111,9 @@ pub fn new() -> Builder {
   )
 }
 
-/// Connect over a Unix domain socket rather than over TCP.
-///
-/// The request's host is still what goes in the `host` header and in the
-/// HTTP/2 `:authority` pseudo-header. Replaces a previous `ipv4_only`,
-/// `ipv6_only` or `with_proxy`.
-///
-/// # Examples
-///
-/// ```gleam
-/// client.new() |> client.unix(path: "/var/run/docker.sock")
-/// ```
-pub fn unix(builder: Builder, path path: String) -> Builder {
-  Builder(..builder, transport: Unix(path))
-}
-
 /// Resolve host names to IPv4 addresses only.
 ///
-/// Replaces a previous `unix`, `ipv6_only` or `with_proxy`.
+/// Replaces a previous `ipv6_only`.
 ///
 /// # Examples
 ///
@@ -138,12 +121,12 @@ pub fn unix(builder: Builder, path path: String) -> Builder {
 /// client.new() |> client.ipv4_only
 /// ```
 pub fn ipv4_only(builder: Builder) -> Builder {
-  Builder(..builder, transport: Tcp(IpV4Only))
+  Builder(..builder, address_family: IpV4Only)
 }
 
 /// Resolve host names to IPv6 addresses only.
 ///
-/// Replaces a previous `unix`, `ipv4_only` or `with_proxy`.
+/// Replaces a previous `ipv4_only`.
 ///
 /// # Examples
 ///
@@ -151,12 +134,11 @@ pub fn ipv4_only(builder: Builder) -> Builder {
 /// client.new() |> client.ipv6_only
 /// ```
 pub fn ipv6_only(builder: Builder) -> Builder {
-  Builder(..builder, transport: Tcp(IpV6Only))
+  Builder(..builder, address_family: IpV6Only)
 }
 
-/// Reach every origin through an HTTP proxy.
-///
-/// Replaces a previous `unix`, `ipv4_only` or `ipv6_only`.
+/// Reach every origin through an HTTP proxy. Requests to a Unix domain socket
+/// ignore it.
 ///
 /// # Examples
 ///
@@ -169,7 +151,7 @@ pub fn ipv6_only(builder: Builder) -> Builder {
 /// ))
 /// ```
 pub fn with_proxy(builder: Builder, proxy: Proxy) -> Builder {
-  Builder(..builder, transport: Proxied(proxy))
+  Builder(..builder, proxy: Some(proxy))
 }
 
 /// Set which versions of HTTP the client speaks. Defaults to `Http2ThenHttp1`.
@@ -244,6 +226,21 @@ pub fn with_default_headers(
   Builder(..builder, default_headers: headers)
 }
 
+/// Set how much of a response body `send` and `dispatch` will hold in memory.
+/// Defaults to 8 MiB. A larger body comes back as `BodyTooLarge`.
+///
+/// `stream` and `dispatch_stream` take their limit from `read_body` and
+/// `read_body_chunk` instead.
+///
+/// # Examples
+///
+/// ```gleam
+/// client.new() |> client.with_max_response_body(bytes: 65_536)
+/// ```
+pub fn with_max_response_body(builder: Builder, bytes bytes: Int) -> Builder {
+  Builder(..builder, max_response_body: bytes)
+}
+
 /// Set how long each stage of a request may take.
 ///
 /// # Examples
@@ -258,8 +255,8 @@ pub fn with_timeouts(builder: Builder, timeouts: Timeouts) -> Builder {
   Builder(..builder, timeouts:)
 }
 
-/// Set how many connections the pool holds and how long it holds them for. Does 
-/// nothing to a request made with `send_once`.
+/// Set how many connections the pool holds and how long it holds them for. Does
+/// nothing to a request made with `dispatch` or `dispatch_stream`.
 ///
 /// # Examples
 ///
@@ -626,7 +623,7 @@ pub type Body {
   Empty
   /// The contents of a file created with the `file` function.
   File(connection.File)
-  /// A body written a chunk at a time created with the `stream_body` function.
+  /// A body written a chunk at a time created with the `streaming` function.
   Streaming(connection.Streaming)
 }
 
@@ -671,12 +668,12 @@ pub fn file(
 }
 
 /// A handle for writing the body of a streamed request given to the handler
-/// by `stream_body`.
+/// by `streaming`.
 pub type BodyWriter =
   connection.BodyWriter
 
 // TODO: think about this one callback vs selector thingie
-/// Set the body of a request to one written a chunk at a time.
+/// Create a request body written a chunk at a time.
 ///
 /// The handler is given a writer and must end the body with `finish_chunk` or
 /// `finish_body`.
@@ -684,16 +681,15 @@ pub type BodyWriter =
 /// # Examples
 ///
 /// ```gleam
-/// request.new()
-/// |> client.stream_body(fn(writer) {
-///   use writer <- result.try(client.send_chunk(writer, <<"Hello, ":utf8>>))
-///   client.finish_chunk(writer, <<"Joe!":utf8>>)
-/// })
+/// request.set_body(
+///   request,
+///   client.streaming(fn(writer) {
+///     use writer <- result.try(client.send_chunk(writer, <<"Hello, ":utf8>>))
+///     client.finish_chunk(writer, <<"Joe!":utf8>>)
+///   }),
+/// )
 /// ```
-pub fn stream_body(
-  request: Request(a),
-  handler: fn(BodyWriter) -> Result(Nil, SendError),
-) -> Request(Body) {
+pub fn streaming(handler: fn(BodyWriter) -> Result(Nil, SendError)) -> Body {
   todo
 }
 
@@ -738,13 +734,56 @@ pub fn finish_body(writer: BodyWriter) -> Result(Nil, SendError) {
   todo
 }
 
+/// Send a request to a Unix domain socket instead of to a host and port.
+///
+/// `localhost` is sent as the `host` header and as the HTTP/2 `:authority` 
+/// pseudo-header unless the request carries a host header of its own.
+///
+/// # Examples
+///
+/// ```gleam
+/// let assert Ok(request) = request.to("http://localhost/containers/json")
+///
+/// client.unix(request, path: "/var/run/docker.sock")
+/// |> request.set_body(client.Empty)
+/// |> client.send(using: client)
+/// ```
+pub fn unix(request: Request(a), path path: String) -> Request(a) {
+  request.set_host(request, path)
+}
+
 /// The connection a response arrived on.
 ///
-/// This is the body of the response given back by `send` and `send_once`. Pass
-/// it to `read_body` or `read_body_chunk` to read the response body or to
-/// `discard_body` or `cancel_body` to get rid of it.
+/// This is the body of the response given back by `stream` and
+/// `dispatch_stream`. Pass it to `read_body` or `read_body_chunk` to read the
+/// response body or to `discard_body` or `cancel_body` to get rid of it.
 pub type Connection =
   connection.Connection
+
+/// Send a request and read the whole response into memory.
+///
+/// The body is limited to `max_response_body` of the client's configuration and
+/// the connection is released once it has been read. Trailer fields are appended
+/// to the response's headers.
+///
+/// # Examples
+///
+/// ```gleam
+/// let assert Ok(request) = request.to("https://gleam.run")
+///
+/// let assert Ok(response) =
+///   request.set_body(request, client.Empty)
+///   |> client.send(using: client)
+///
+/// bit_array.to_string(response.body)
+/// // -> Ok("<!DOCTYPE html>...")
+/// ```
+pub fn send(
+  request: Request(Body),
+  using client: Client,
+) -> Result(Response(BitArray), SendError) {
+  todo
+}
 
 /// Send a request and wait for the response head.
 ///
@@ -759,21 +798,21 @@ pub type Connection =
 ///
 /// use response <- result.try(
 ///   request.set_body(request, client.Empty)
-///   |> client.send(using: client),
+///   |> client.stream(using: client),
 /// )
 /// ```
-pub fn send(
+pub fn stream(
   request: Request(Body),
   using client: Client,
 ) -> Result(Response(Connection), SendError) {
   todo
 }
 
-/// Send a request over a connection of its own outside a pool.
+/// Send a request over a connection of its own outside a pool and read the
+/// whole response into memory.
 ///
-/// The connection belongs to the calling process and is closed once the body
-/// has been read. Responses are read back as they are from `send`. Every call
-/// pays for a name lookup, a connection and a TLS handshake.
+/// The connection is closed once the response has been read. Every call pays
+/// for a name lookup, a connection and a TLS handshake.
 ///
 /// # Examples
 ///
@@ -782,9 +821,32 @@ pub fn send(
 ///
 /// let assert Ok(response) =
 ///   request.set_body(request, client.Empty)
-///   |> client.send_once(using: client.new())
+///   |> client.dispatch(using: client.new())
 /// ```
-pub fn send_once(
+pub fn dispatch(
+  request: Request(Body),
+  using builder: Builder,
+) -> Result(Response(BitArray), SendError) {
+  todo
+}
+
+/// Send a request over a connection of its own outside a pool and wait for the
+/// response head.
+///
+/// The connection belongs to the calling process and is closed once the body
+/// has been read. Responses are read back as they are from `stream`.
+///
+/// # Examples
+///
+/// ```gleam
+/// let assert Ok(request) = request.to("https://gleam.run/large.iso")
+///
+/// use response <- result.try(
+///   request.set_body(request, client.Empty)
+///   |> client.dispatch_stream(using: client.new()),
+/// )
+/// ```
+pub fn dispatch_stream(
   request: Request(Body),
   using builder: Builder,
 ) -> Result(Response(Connection), SendError) {
@@ -937,6 +999,8 @@ pub type SendError {
   /// The file behind a `File` body could not be read when the request was
   /// sent.
   FileFailed(reason: FileError)
+  /// The response head arrived but `send` or `dispatch` could not read the body.
+  BodyFailed(reason: BodyError)
   /// The socket refused the read or the write.
   SocketError(reason: SocketReason)
 }
